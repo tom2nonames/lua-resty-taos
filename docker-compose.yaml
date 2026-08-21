@@ -1,26 +1,32 @@
-# A simple bundle docker container for orange
-# docker-compose.yml文件的版本
-version: "3"
-# 管理的服务
+# lua-resty-taos real-environment test stack.
+#
+# One container runs both the TDengine 2.4 server (taosd) and an OpenResty
+# with this driver loaded, exposing:
+#   :6030  - TDengine native port (taosd)
+#   :6041  - TDengine REST port
+#   :8080  - nginx test endpoints (/version, /test)
+#
+# The image must run as linux/amd64 (TDengine 2.4 only ships x86_64;
+# Docker auto-emulates on arm64 hosts).
+#
+# Quick start:
+#   docker compose up --build -d
+#   curl http://127.0.0.1:8080/test
+#   docker compose exec taos resty --errlog-level debug /usr/local/lvhuan/lua-resty-taos/test.lua
 services:
-  cloud:
+  taos:
     build:
       context: .
       dockerfile: ./docker/Dockerfile
-    image: reg.docker.lhdrr.com:8081/lvhuan/lua-resty-taos:${TAG:-dev}
-    hostname: taos
-    container_name: lh-taos-${TAG:-dev}
+    image: lvhuan/lua-resty-taos:test
+    platform: linux/amd64
+    container_name: lh-taos-test
     ports:
-      - "28866:8866"
+      - "6030:6030"
+      - "6041:6041"
+      - "8080:8080"
     volumes:
+      # Live-mount the library and test scripts for fast iteration.
       - ./lib:/usr/local/lvhuan/lua-resty-taos/lib:rw
       - ./test.lua:/usr/local/lvhuan/lua-resty-taos/test.lua:rw
-    environment:
-      DEBUG: ${DEBUG:-0}
-      TAG: ${TAG:-dev}
-      MODE: ${MODE:-dev}
-    networks:
-      - app
-networks:
-  app:
-    external: true
+      - ./test1.lua:/usr/local/lvhuan/lua-resty-taos/test1.lua:rw
