@@ -1,0 +1,9 @@
+# test::nginx runtime artifacts
+t/servroot/
+t/servroot_*/
+
+# macOS
+.DS_Store
+
+# stray debug log
+1.log
