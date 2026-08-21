@@ -2,7 +2,6 @@ local taos_lib  = require("resty.taos.library")
 local taos_data = require("resty.taos.data")
 
 local ffi = require("ffi")
-local ffi_gc     = ffi.gc
 local ffi_cast   = ffi.cast
 local ffi_new    = ffi.new
 local ffi_copy   = ffi.copy
@@ -37,6 +36,13 @@ function _M.new(self, result)
         return nil
     end
 
+    -- NOTE: no ffi.gc finalizer is attached to TAOS_RES handles.  With the
+    -- TDengine 2.4 client library, attaching ANY finalizer (C function or
+    -- Lua closure) to a TDengine handle makes tightly-looped operations
+    -- segfault under LuaJIT (verified with bare FFI and with the consume
+    -- loop above).  The result set is therefore released exclusively by
+    -- the explicit free(); callers that use totable() get the result
+    -- released by the query()/consume() wrappers.
     local wrapper = {
         result = result
     }
@@ -50,8 +56,8 @@ end
 function _M.fetch_row(self)
     local taos_row = C.taos_fetch_row(self.result)
 
-    if taos_row == cdata_null_point or taos_row == true then
-        -- ngx_log(ngx_DEBUG,"taos_fetch_row return data type is bool. value: " , tostring(taos_row))
+    if taos_row == cdata_null_point then
+        -- End of result set.
         return nil
     end
 
@@ -105,15 +111,18 @@ function _M.stop(self)
 end
 
 function _M.free(self)
-    C.taos_free_result(self.result)
-    self.result = nil
-    self = nil
+    if self.result ~= nil then
+        C.taos_free_result(self.result)
+        self.result = nil
+    end
 end
 
 function _M.errstr(self)
-    local str = ffi_new("char *")
+    local str = ""
 
-    if self.result then
+    -- Note: a NULL cdata is truthy in Lua, so we must compare against nil
+    -- explicitly instead of relying on `if self.result then`.
+    if self.result ~= nil then
         str = C.taos_errstr(self.result)
         str = ffi_string(str)
     end
@@ -122,7 +131,10 @@ function _M.errstr(self)
 end
 
 function _M.errno(self)
-    return C.taos_errno(self.result)
+    if self.result ~= nil then
+        return C.taos_errno(self.result)
+    end
+    return 0
 end
 
 function _M.totable(self)
@@ -142,7 +154,7 @@ function _M.totable(self)
     local affect_rows = self:affected_rows()
     local items = {}
 
-    ngx.log(ngx.DEBUG,"num_fileds: ", num_fields, " affect_rows: ", affect_rows)
+    ngx.log(ngx.DEBUG, "num_fileds: ", num_fields, " affect_rows: ", affect_rows)
     local row = self:fetch_row()
     while(row) do
         rows = rows + 1
@@ -155,7 +167,10 @@ function _M.totable(self)
                 if func then
                     item[name] = func(row[i])
                 else
-                    ngx.log(ngx.ERROR, "data type: ", type, " not match!!!", "item name: ", name, "data value: ", row[i])
+                    -- row[i] is a cdata pointer; tostring() is required
+                    -- because the real ngx.log rejects non-string args.
+                    ngx.log(ngx.ERR, "data type: ", type, " not match!!!",
+                            "item name: ", name, "data value: ", tostring(row[i]))
                 end
             end
         end

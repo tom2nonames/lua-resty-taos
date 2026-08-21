@@ -171,4 +171,26 @@ ffi_cdef[[
 
 ]];
 
-return ffi_load "taos"
+-- Load the TDengine client library (libtaos).
+-- The cdef block above is registered as a side effect of requiring this
+-- module, so the type declarations are always available.
+--
+-- When the native library is missing (e.g. during unit tests on a machine
+-- without libtaos installed), we return a placeholder table instead of
+-- raising a hard error at require time.  Any call into the placeholder
+-- raises a descriptive error.  Unit tests can then swap in a mock by
+-- replacing `package.loaded["resty.taos.library"]` before loading the
+-- modules under test.
+local ok, lib = pcall(ffi_load, "taos")
+if not ok then
+    lib = setmetatable({ _placeholder = true }, {
+        __index = function(_, name)
+            return function()
+                error("resty.taos.library: function '" .. tostring(name) ..
+                      "' called but the native 'taos' library is not loaded", 2)
+            end
+        end
+    })
+end
+
+return lib

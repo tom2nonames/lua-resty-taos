@@ -1,12 +1,11 @@
 local taos_lib    = require("resty.taos.library")
-local taos_data   = require("resty.taos.data")
 local taos_result = require("resty.taos.result")
---local taos_async  = require("resty.taos.async")
+local taos_async  = require("resty.taos.async")
+local taos_stmt   = require("resty.taos.stmt")
 local ffi = require("ffi")
 
 
 local ffi_cast   = ffi.cast
-local ffi_new    = ffi.new
 local ffi_copy   = ffi.copy
 local ffi_string = ffi.string
 
@@ -39,18 +38,19 @@ end
 
 local function get_error_string(res)
 
-    local str = ffi_new("char *")
-          str = C.taos_errstr(res)
+    local str = C.taos_errstr(res)
           str = ffi_string(str)
 
     return  str
 end
 
 function _M.get_error_string(self, res)
-    if res then
+    if res ~= nil then
         return get_error_string(res)
     end
-    if self.conn then
+    -- A NULL cdata is truthy in Lua, so `self.conn` must be compared
+    -- against nil explicitly.
+    if self.conn ~= nil then
         return get_error_string(self.conn)
     end
     return "not connect."
@@ -61,11 +61,13 @@ local function get_error_no(res)
 end
 
 function _M.get_error_no(self, res)
-    if not res then
-        return get_error_no(self.conn)
-    else
+    if res ~= nil then
         return get_error_no(res)
     end
+    if self.conn ~= nil then
+        return get_error_no(self.conn)
+    end
+    return 0
 end
 
 function _M.init(self)
@@ -97,7 +99,10 @@ function _M.options(self, opts)
         -- max_otpions  = ffi.C.TSDB_MAX_OPTIONS,
     }
 
-    for k, v in ipairs(opts) do
+    -- opts is a key/value map, so it must be iterated with pairs().  The
+    -- previous implementation used ipairs() against the option *values*,
+    -- which made this function a silent no-op.
+    for k, v in pairs(opts) do
         local option = match[k]
         if option then
             C.taos_options(option, v )
@@ -111,22 +116,34 @@ function _M.connect(self, conf)
     local code = 0
     local err_msg = nil
     self:init()
-    local taos = ffi_new("TAOS *")
 
     local port      = ffi_cast("uint16_t",      conf.port)
     local user      = ffi_cast("const char *",  conf.user)
     local password  = ffi_cast("const char *",  conf.password)
     local host      = ffi_cast("const char *",  conf.host)
-    local db        = ffi_cast("const char *",  conf.database)
+    local db        = ffi_cast("const char *",  conf.database or "")
 
-    taos = C.taos_connect(host, user, password, db, port)
+    local taos = C.taos_connect(host, user, password, db, port)
 
-    if ffi_cast("void *",taos) <= nil then
+    -- On failure taos_connect returns NULL.  Note: NULL cdata is truthy in
+    -- Lua, so this must be an explicit comparison against nil (and the
+    -- previous `<= nil` idiom, while working, was unreadable).
+    if taos == nil then
         code = -1
-        err_msg = "failed to connect server, reason: " .. self:get_error_string()
+        -- There is no valid handle to ask for a detailed error string, so
+        -- report the target instead of calling taos_errstr(NULL).
+        err_msg = "failed to connect server " .. tostring(conf.host or "?")
+                  .. ":" .. tostring(conf.port)
+    else
+        -- NOTE: we deliberately do NOT attach a ffi.gc finalizer to the
+        -- connection handle.  With the TDengine 2.4 client library,
+        -- attaching ANY finalizer (C function or closure) to the TAOS*
+        -- handle makes tightly-looped queries segfault under LuaJIT (a
+        -- client/library interaction; verified with bare FFI).  The
+        -- connection is therefore released exclusively by the explicit
+        -- close() call.
+        self.conn = taos
     end
-
-    self.conn = taos
 
     return {
         code  = code,
@@ -141,38 +158,69 @@ function _M.query(self, sql)
     local res = C.taos_query(taos, sql)
     local result = taos_result:new(res)
     if result then
-        local ret = result:totable()
+        -- LEAK FIX: release the C result even when totable() raises, so
+        -- an unexpected Lua error mid-conversion does not leak the result
+        -- set (there is no GC finalizer: attaching one to TDengine handles
+        -- segfaults with this client under tight loops).
+        local ok, ret = pcall(function()
+            return result:totable()
+        end)
         result:free()
-        return ret
+        if ok then
+            return ret
+        end
+        error(ret, 0)
     end
 
     return nil
 end
 
---[[
 function _M.query_async(self, sql, callback)
     local async = taos_async:new(self)
-    return async:query(sql, callback)
+    local ok, err = async:query(sql, callback)
+    if ok then
+        -- The C side may still invoke the callback after this function
+        -- returns, so the async wrapper (and the callback trampoline it
+        -- references) must stay alive.  Retain it on the driver with a
+        -- slot; async.lua removes it once the callback has fired, so the
+        -- list stays bounded (see async.lua query()).
+        self.asyncs = self.asyncs or {}
+        local slot = #self.asyncs + 1
+        self.asyncs[slot] = async
+        async._driver = self
+        async._slot = slot
+    end
+    return ok, err
 end
 
 function _M.fetch_rows_async(self, res, callback)
     local async = taos_async:new(self)
-    return async:fetch_rows(res, callback)
+    local ok, err = async:fetch_rows(res, callback)
+    if ok then
+        self.asyncs = self.asyncs or {}
+        local slot = #self.asyncs + 1
+        self.asyncs[slot] = async
+        async._driver = self
+        async._slot = slot
+    end
+    return ok, err
 end
---]]
 
 function _M.close(self)
     local taos = self.conn
     local code = -1
     local err_msg = "null pointer."
 
-    if ffi_cast("void *", taos) > nil then
+    if taos ~= nil then
         C.taos_close(taos)
         code = 0
         err_msg = "done."
     end
 
     self.conn = nil
+    -- Release any async wrappers whose callbacks never fired (the driver
+    -- is done, so their trampolines are no longer needed).
+    self.asyncs = nil
     return {
         code  = code,
         error = err_msg
@@ -189,7 +237,7 @@ function _M.get_server_info(self)
 end
 
 function _M.select_db(self, db)
-    if self.conn and db then
+    if self.conn ~= nil and db then
         local recode = C.taos_select_db(self.conn, db)
         if recode < 0 then
             return nil, self:get_error_string()
@@ -201,8 +249,19 @@ function _M.select_db(self, db)
 end
 
 function _M.validate_sql(self, sql)
+    if self.conn == nil then
+        return nil, "not connected."
+    end
     local code = C.taos_validate_sql(self.conn, sql)
     return code
+end
+
+-- Create a prepared-statement wrapper bound to this connection.
+function _M.stmt(self)
+    if self.conn == nil then
+        return nil, "not connected."
+    end
+    return taos_stmt:new(self.conn)
 end
 
 return _M

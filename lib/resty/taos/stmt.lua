@@ -2,7 +2,6 @@ local taos_lib  = require("resty.taos.library")
 local taos_data = require("resty.taos.data")
 
 local ffi = require("ffi")
-local ffi_gc     = ffi.gc
 local ffi_cast   = ffi.cast
 local ffi_new    = ffi.new
 local ffi_copy   = ffi.copy
@@ -28,16 +27,27 @@ local mt = { __index = _M }
 
 function _M.new(self, conn)
 
+    if conn == nil then
+        return nil, "not connected."
+    end
+
     local stmt = C.taos_stmt_init(conn)
 
+    -- NOTE: no ffi.gc finalizer.  Attaching finalizers to TDengine handles
+    -- has been shown to segfault under tight loops with the 2.4 client
+    -- (verified with bare FFI), so the statement is released exclusively
+    -- by the explicit close().
     local wrapper = {
-        stmt = ffi_gc(stmt, C.taos_stmt_close)
+        stmt = stmt
     }
     return setmetatable(wrapper, mt)
 end
 
-function _M.prepare(self, sql, lenght)
-    return C.taos_stmt_prepare(self.stmt, sql, lenght)
+-- The SQL length is optional; when omitted it is derived from the string
+-- itself (previously the caller had to pass it explicitly).
+function _M.prepare(self, sql, length)
+    length = length or #sql
+    return C.taos_stmt_prepare(self.stmt, sql, length)
 end
 
 function _M.bind_param(self, bind)
@@ -60,7 +70,10 @@ function _M.use_result(self)
 end
 
 function _M.close(self)
+    -- Releases the prepared statement (there is no GC finalizer, so this
+    -- must be called explicitly).
     C.taos_stmt_close(self.stmt)
+    self.stmt = nil
 end
 
 return _M

@@ -51,7 +51,6 @@ function _M.open(self, sql, stime, handle, callback )
 
         local result = taos_result:new(res)
 
-        local p = ffi_cast("cb_param *", param)
         local fields = result:fetch_fields()
         local num_fields = result:field_count()
 
@@ -67,7 +66,9 @@ function _M.open(self, sql, stime, handle, callback )
             end
         end
 
-        result:free()
+        -- Note: the result set is owned and freed by the TDengine stream
+        -- machinery after the handler returns; do NOT call result:free()
+        -- here (this has flip-flopped in git history and double-frees).
 
         handle(item)
     end)
@@ -80,7 +81,9 @@ function _M.open(self, sql, stime, handle, callback )
         self.callback = cb
         ngx_log(ngx_DEBUG, "has callback")
     else
-        cb = ffi_new("void *", nil)
+        -- Use a NULL function pointer instead of a NULL void*: assigning
+        -- the latter to the CALLBACK struct field is a type mismatch.
+        cb = ffi_new("CALLBACK", nil)
         self.callback = nil
 
         ngx_log(ngx_DEBUG, "not callback")
@@ -88,17 +91,21 @@ function _M.open(self, sql, stime, handle, callback )
     p.callback = cb
     local param = ffi_new( "void *", p)
 
-    local s = ffi_new("void *")
-          s = C.taos_open_stream(taos, sql, stream_handle, stime, param, cb)
+    local s = C.taos_open_stream(taos, sql, stream_handle, stime, param, cb)
 
-    if ffi_cast("void *", s) > nil then
+    -- NULL cdata is truthy in Lua, so compare against nil explicitly.
+    if s ~= nil then
         code = 0
-	    local sp = ffi_cast("void *",s)
+        local sp = ffi_cast("void *",s)
         p.stream = sp
-        stream = p
+        -- `stream` is the TAOS_STREAM* handle that close() must pass back
+        -- to taos_close_stream(); the cb_param `p` is kept alive in
+        -- self.param so the callback context survives.
+        stream = sp
     end
 
     self.stream = stream
+    self.param = p
     self.handle = stream_handle
 
     return {
@@ -109,12 +116,19 @@ function _M.open(self, sql, stime, handle, callback )
 end
 
 function _M.close(self)
+    if self.stream == nil then
+        return nil, "no stream opened."
+    end
+
     C.taos_close_stream(self.stream)
     self.stream = nil
-    self.handle:free()
-    if self.callback then
-        self.callback:free()
-    end
+    self.param = nil
+
+    -- The handler and callback cdata are referenced by self, so they stay
+    -- alive for as long as the stream is open; the garbage collector
+    -- reclaims them once unreferenced.
+    self.handle = nil
+    self.callback = nil
     return true
 end
 

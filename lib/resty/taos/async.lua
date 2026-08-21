@@ -49,40 +49,63 @@ function _M.query(self, sql, callback)
 
     local handle = ffi_new("TAOS_QUERY_CALLBACK",
                             function(param, res, code)
-                                local p = ffi_cast("async_query_callback_param *", param)
-                                local cb = p.callback
+                                -- `callback` is captured as an upvalue and
+                                -- invoked directly as a Lua function.
+                                -- Previously the callback was wrapped in a
+                                -- CALLBACK cdata and called with a Lua
+                                -- table, which made LuaJIT raise
+                                -- "cannot convert 'table' to 'void *'"
+                                -- whenever the async callback fired.
+                                local ret
                                 if code < 0 then
-                                    return cb({
-                                            code  = nil,
+                                    ret = callback({
+                                            code  = code,
                                             error = self.cwrap:get_error_string(res)
                                         })
+                                else
+                                    local affect_rows = C.taos_affected_rows(res)
+                                    ret = callback({
+                                        code = 0,
+                                        error = "ok",
+                                        affected = affect_rows,
+                                        res = res
+                                    })
                                 end
 
-                                local affect_rows = C.taos_affected_rows(res)
-                                return cb({
-                                    code = 0,
-                                    error = "ok",
-                                    affected = affect_rows,
-                                    res = res
-                                })
+                                -- LEAK FIX: taos_query_a() invokes its
+                                -- callback exactly once, so once we are
+                                -- here the C side will never call this
+                                -- trampoline again.  Drop the references so
+                                -- the callback cdata (and its machine-code
+                                -- trampoline) become garbage-collectable,
+                                -- and remove the wrapper from the driver's
+                                -- keep-alive list.  Otherwise every
+                                -- query_async() leaks one wrapper + one
+                                -- trampoline for the lifetime of the
+                                -- driver.
+                                self.handle = nil
+                                self.param = nil
+                                if self._driver and self._driver.asyncs
+                                   and self._driver.asyncs[self._slot] == self then
+                                    self._driver.asyncs[self._slot] = nil
+                                end
+                                return ret
                             end)
 
     local p = ffi_new("async_query_callback_param")
-    local cb
-    if callback and type(callback) == "function" then
-        cb = ffi_new("CALLBACK", callback)
-    else
-        cb = ffi_new("void *", nil)
-    end
-
-    p.callback = cb
-
     local param = ffi_new("void *", p)
 
     local taos = self.cwrap.conn
     C.taos_query_a(taos, sql, handle, param)
 
-    handle:free()
+    -- IMPORTANT: do NOT call handle:free() here.  taos_query_a() is
+    -- asynchronous and may still invoke the callback after this function
+    -- returns; freeing the cdata now would be a use-after-free.  Keep the
+    -- reference on the wrapper so the trampoline survives until the
+    -- callback has fired (the callback cdata is then reclaimed by GC once
+    -- `self` goes out of scope).
+    self.handle = handle
+    self.param = p
 
     return true
 
@@ -94,31 +117,24 @@ function _M.fetch_rows(self, res, callback)
     end
 
     local handle = ffi_new("TAOS_QUERY_CALLBACK",
-                            function(param, res, num_of_rows)
-                                local p = ffi_cast("async_query_callback_param *", param)
-                                local cb = p.callback
-                                return cb({
+                            function(param, tres, num_of_rows)
+                                -- See query(): invoke the Lua callback
+                                -- directly rather than through a cdata.
+                                return callback({
                                     num_of_rows = num_of_rows,
-                                    res = res
+                                    res = tres
                                 })
                             end)
 
     local p = ffi_new("async_query_callback_param")
-    local cb
-    if callback and type(callback) == "function" then
-        cb = ffi_new("CALLBACK", callback)
-    else
-        cb = ffi_new("void *", nil)
-    end
-
-    p.callback = cb
-
     local param = ffi_new("void *", p)
 
-    local taos = self.cwrap.conn
     C.taos_fetch_rows_a(res, handle, param)
 
-    handle:free()
+    -- See the note in query(): the callback cdata must not be freed
+    -- before the async operation completes.
+    self.handle = handle
+    self.param = p
 
     return true
 end
