@@ -36,6 +36,7 @@ local SPECS = {
     "t.subscribe_spec",
     "t.stream_spec",
     "t.async_spec",
+    "t.examples_spec",
 }
 
 for _, spec in ipairs(SPECS) do

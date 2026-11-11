@@ -39,6 +39,19 @@ docker compose exec taos /bin/bash
   TIMESTAMP/INT/DOUBLE conversion
 * nginx error log: zero `[error]` lines across all of the above
 
+## Security notes
+
+This stack is a **development/test environment**, not a deployment
+template:
+
+* `root` / `taosdata` are the TDengine demo credentials; the endpoints and
+  the container must not be exposed publicly.
+* `/version` and `/test` are diagnostics: they expose client/server
+  versions and the demo database contents.
+* Driver errors are reduced to numeric `code=` values before they reach
+  the HTTP response (raw `taos_errstr()` text can leak SQL/schema
+  details).  The error log runs at `warn`, never `debug`.
+
 ## Notes
 
 * The image must run as `linux/amd64`: TDengine 2.4 only ships x86_64

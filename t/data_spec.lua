@@ -88,6 +88,35 @@ helper.test("BINARY and NCHAR strings", function()
     helper.assert_eq(data[T.BINARY](helper.char_buf("")), "")
 end)
 
+helper.test("BINARY/NCHAR honour an explicit byte length", function()
+    -- S1 regression: a fixed-length BINARY column is not guaranteed to be
+    -- NUL terminated, and its value may legitimately contain embedded NULs.
+    -- The converter must use the byte length reported by
+    -- taos_fetch_lengths() instead of reading until the first NUL.
+    local embedded = ffi.new("char[6]")
+    ffi.copy(embedded, "ab\0cd")                       -- 5 bytes + terminator
+    helper.assert_eq(data[T.BINARY](embedded, 5), "ab\0cd")
+    helper.assert_eq(data[T.BINARY](embedded, 2), "ab")
+
+    -- Buffer with no NUL terminator at all: the old ffi_string(data) would
+    -- read past the end of the allocation.
+    local raw = ffi.new("char[3]")
+    ffi.copy(raw, "abc", 3)
+    helper.assert_eq(data[T.BINARY](raw, 3), "abc")
+
+    -- A reported length of zero means the empty string.
+    helper.assert_eq(data[T.BINARY](embedded, 0), "")
+
+    -- NCHAR is a UTF-8 byte string; slicing by byte length is exact.
+    local cn = helper.char_buf("中文")
+    helper.assert_eq(data[T.NCHAR](cn, 6), "中文")
+    helper.assert_eq(data[T.NCHAR](cn, 3), "中")
+
+    -- Without a length the historical NUL-terminated behaviour is kept.
+    helper.assert_eq(data[T.BINARY](embedded), "ab")
+    helper.assert_eq(data[T.NCHAR](helper.char_buf("中文")), "中文")
+end)
+
 helper.test("TIMESTAMP converts to a Lua number", function()
     helper.assert_eq(data[T.TIMESTAMP](ffi.new("int64_t[1]", 1600000000000)), 1600000000000)
     helper.assert_eq(data[T.TIMESTAMP](ffi.new("int64_t[1]", -1)), -1)

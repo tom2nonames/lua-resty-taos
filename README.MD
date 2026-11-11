@@ -406,6 +406,25 @@ the keep-alive list.
 These paths are all covered by dedicated unit tests and are part of the
 100% line coverage (see below).
 
+## 7. Security: error text and the example stack
+
+`taos_errstr()` returns the server's diagnostic text.  It can echo SQL
+fragments, table/column names and server details, so treat it as internal
+diagnostics: log it with `ngx.log(ngx.ERR, ...)` and return a stable error
+code (for example `res.code`) to the client, not the raw string.
+
+The `docker/` stack is a development/test aid, **not a deployment
+template**:
+
+* `docker/nginx.conf` exposes the `/version` and `/test` diagnostic
+  endpoints and runs over plain HTTP on port 8080;
+* it uses the TDengine demo credentials (`root` / `taosdata`);
+* it must not be exposed to untrusted networks.
+
+The example endpoints follow the guidance above: failures are reported as
+numeric `code=` values, and the container's `error_log` runs at `warn`
+(never `debug`).
+
 # unit tests
 Two suites are provided.  Neither requires a TDengine server or the
 native `libtaos` library: the C layer is replaced by a mock (`t/helper.lua`)

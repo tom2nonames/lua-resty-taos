@@ -158,6 +158,12 @@ function _M.totable(self)
     local row = self:fetch_row()
     while(row) do
         rows = rows + 1
+        -- taos_fetch_lengths() returns the byte length of every column in
+        -- the row that was just fetched.  Binary/NCHAR converters need it:
+        -- those columns are not NUL-terminated and may contain NULs.
+        -- A NULL cdata compares equal to nil, so `lens ~= nil` is the
+        -- correct "did the C library return lengths?" check.
+        local lens = self:fetch_lengths()
         local item = {}
         for i = 0, num_fields-1, 1 do
             if ffi_cast("void *",row[i]) > nil then
@@ -165,7 +171,11 @@ function _M.totable(self)
                 local type = fields[i+1].type
                 local func = taos_data[type]
                 if func then
-                    item[name] = func(row[i])
+                    local len = nil
+                    if lens ~= nil then
+                        len = lens[i]
+                    end
+                    item[name] = func(row[i], len)
                 else
                     -- row[i] is a cdata pointer; tostring() is required
                     -- because the real ngx.log rejects non-string args.

@@ -92,6 +92,35 @@ helper.test("handler receives converted rows and does not free the result", func
     helper.assert_eq(p.stream, helper.ptr())
 end)
 
+helper.test("handler converts binary columns with the reported length", function()
+    -- S1 regression: the stream handler must slice BINARY/NCHAR values with
+    -- taos_fetch_lengths() rather than reading until a NUL byte.
+    helper.reset()
+    helper.on("taos_field_count", function() return 1 end)
+    helper.on("taos_fetch_fields", function()
+        return helper.fields({ "owner", 8, 10 })
+    end)
+    helper.on("taos_fetch_lengths", function()
+        return ffi.new("int[1]", 5)
+    end)
+    helper.on("taos_open_stream", function() return helper.ptr() end)
+
+    local st = stream:new(fake_cwrap())
+    local got
+    st:open("select * from t", 0, function(item)
+        got = item
+    end, function() end)
+
+    local args = helper.called("taos_open_stream")
+    local handler, param = args[3], args[5]
+    local buf = ffi.new("char[6]")
+    ffi.copy(buf, "ab\0cd")                            -- 5 bytes, embedded NUL
+    handler(param, helper.res(), helper.row(buf))
+
+    helper.assert_not_nil(got)
+    helper.assert_eq(got.owner, "ab\0cd")
+end)
+
 helper.test("close() passes the TAOS_STREAM handle to the C library", function()
     helper.reset()
     helper.on("taos_open_stream", function() return helper.ptr() end)

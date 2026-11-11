@@ -53,6 +53,9 @@ function _M.open(self, sql, stime, handle, callback )
 
         local fields = result:fetch_fields()
         local num_fields = result:field_count()
+        -- Byte lengths of the current row, needed to convert BINARY/NCHAR
+        -- columns exactly (they are not NUL-terminated and may embed NULs).
+        local lens = result:fetch_lengths()
 
         local item = {}
 
@@ -62,7 +65,11 @@ function _M.open(self, sql, stime, handle, callback )
                 local name = fields[i+1].name
                 local type = fields[i+1].type
                 local func = taos_data[type]
-                item[name] = func(row[i])
+                local len = nil
+                if lens ~= nil then
+                    len = lens[i]
+                end
+                item[name] = func(row[i], len)
             end
         end
 

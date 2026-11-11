@@ -160,6 +160,42 @@ helper.test("fetch_lengths() forwards to the C library", function()
     helper.assert_eq(#helper.calls("taos_fetch_lengths"), 1)
 end)
 
+helper.test("totable() uses taos_fetch_lengths() for binary columns", function()
+    -- S1 regression: binary/NCHAR columns are not NUL terminated and can
+    -- contain embedded NULs.  totable() must slice them with the byte
+    -- length reported per row instead of reading until the first NUL.
+    helper.reset()
+    helper.on("taos_errno", function() return 0 end)
+    helper.on("taos_field_count", function() return 1 end)
+    helper.on("taos_fetch_fields", function()
+        return helper.fields({ "owner", 8, 10 })
+    end)
+    helper.on("taos_affected_rows", function() return 1 end)
+    helper.on("taos_fetch_lengths", function()
+        return ffi.new("int[1]", 5)
+    end)
+
+    local buf = ffi.new("char[6]")
+    ffi.copy(buf, "ab\0cd")                            -- 5 bytes, embedded NUL
+    local i = 0
+    helper.on("taos_fetch_row", function()
+        i = i + 1
+        if i == 1 then
+            return helper.row(buf)
+        end
+        return ffi.new("void**", nil)
+    end)
+
+    local r = result:new(helper.res())
+    local t = r:totable()
+
+    helper.assert_eq(t.code, 0)
+    helper.assert_eq(#t.item, 1)
+    helper.assert_eq(t.item[1].owner, "ab\0cd")
+    -- lengths are queried once per fetched row (only the data row here).
+    helper.assert_eq(#helper.calls("taos_fetch_lengths"), 1)
+end)
+
 helper.test("totable() logs an error for unknown column types", function()
     helper.reset()
     helper.on("taos_errno", function() return 0 end)

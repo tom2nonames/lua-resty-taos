@@ -99,18 +99,33 @@ local case = {}
         return c_double_to_lua(data)
     end
 
-    case[db_type.TSDB_DATA_TYPE_BINARY] = function(data)
-        local val = ffi_string(data)
-        return val
+    case[db_type.TSDB_DATA_TYPE_BINARY] = function(data, len)
+        -- Do not rely on NUL termination.  TDengine reports the exact byte
+        -- length of each value through taos_fetch_lengths(); a fixed-length
+        -- BINARY column is not guaranteed to be NUL terminated (reading it
+        -- with ffi_string(data) can overrun the buffer) and the value may
+        -- legitimately contain embedded NULs (which would be silently
+        -- truncated).  Callers that pass a length get an exact slice.
+        if len ~= nil then
+            return ffi_string(data, len)
+        end
+        -- Historical fallback for callers that do not supply a length.
+        return ffi_string(data)
     end
 
     case[db_type.TSDB_DATA_TYPE_TIMESTAMP] = function(data)
         return tonumber(c_int64_to_string(data, false))
     end
 
-    case[db_type.TSDB_DATA_TYPE_NCHAR] = function(data)
-        local val = ffi_string(data)
-        return val
+    case[db_type.TSDB_DATA_TYPE_NCHAR] = function(data, len)
+        -- NCHAR values are UTF-8 byte strings; the C library reports the
+        -- byte length via taos_fetch_lengths().  Use it for the same
+        -- reasons as BINARY above (no NUL-termination guarantee, embedded
+        -- NULs, fixed-length columns).
+        if len ~= nil then
+            return ffi_string(data, len)
+        end
+        return ffi_string(data)
     end
 
     case[db_type.TSDB_DATA_TYPE_UTINYINT] = function(data)

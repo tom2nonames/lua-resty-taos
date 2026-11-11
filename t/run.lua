@@ -27,6 +27,7 @@ local DEFAULT_SPECS = {
     "t.subscribe_spec",
     "t.stream_spec",
     "t.async_spec",
+    "t.examples_spec",
 }
 
 local specs = {}
