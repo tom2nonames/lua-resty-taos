@@ -16,6 +16,7 @@ build = {
       ["resty.taos.async"] = "lib/resty/taos/async.lua",
       ["resty.taos.data"] = "lib/resty/taos/data.lua",
       ["resty.taos.library"] = "lib/resty/taos/library.lua",
+      ["resty.taos.pool"] = "lib/resty/taos/pool.lua",
       ["resty.taos.result"] = "lib/resty/taos/result.lua",
       ["resty.taos.stmt"] = "lib/resty/taos/stmt.lua",
       ["resty.taos.stream"] = "lib/resty/taos/stream.lua",
