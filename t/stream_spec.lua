@@ -121,6 +121,21 @@ helper.test("handler converts binary columns with the reported length", function
     helper.assert_eq(got.owner, "ab\0cd")
 end)
 
+helper.test("handler tolerates a NULL result set", function()
+    helper.reset()
+    helper.on("taos_open_stream", function() return helper.ptr() end)
+
+    local st = stream:new(fake_cwrap())
+    local called = false
+    st:open("select * from t", 0, function() called = true end, function() end)
+
+    local args = helper.called("taos_open_stream")
+    local handler, param = args[3], args[5]
+    -- No crash, and the row handler is not invoked for a NULL result.
+    handler(param, ffi.cast("TAOS_RES *", 0), helper.row(helper.int64_buf(1)))
+    helper.assert_false(called)
+end)
+
 helper.test("close() passes the TAOS_STREAM handle to the C library", function()
     helper.reset()
     helper.on("taos_open_stream", function() return helper.ptr() end)

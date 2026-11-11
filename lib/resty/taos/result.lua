@@ -32,7 +32,10 @@ local ct = ffi_typeof("TAOS_RES *")
 
 function _M.new(self, result)
 
-    if not ffi_istype(ct, result) then
+    -- A NULL cdata still passes ffi.istype(), but wrapping it would make
+    -- every accessor dereference a NULL TAOS_RES*.  Reject it so callers
+    -- get nil (query() then reports the failed C call instead of raising).
+    if not ffi_istype(ct, result) or result == nil then
         return nil
     end
 

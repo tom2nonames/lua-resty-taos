@@ -31,6 +31,12 @@ helper.test("new() rejects non-TAOS_RES values", function()
     helper.assert_nil(result:new(42))
 end)
 
+helper.test("new() rejects a NULL result pointer", function()
+    -- taos_query() returns NULL when it cannot produce a result set; a
+    -- NULL cdata passes istype(), but wrapping it would dereference NULL.
+    helper.assert_nil(result:new(ffi.cast("TAOS_RES *", 0)))
+end)
+
 helper.test("new() accepts a TAOS_RES* handle", function()
     local r = result:new(helper.res())
     helper.assert_not_nil(r)
@@ -41,7 +47,10 @@ helper.test("errstr/errno are safe on a NULL result", function()
     -- guard passed and the C function was called with NULL.  errstr/errno
     -- must return "" / 0 and never touch the C library.
     helper.reset()
-    local r = result:new(ffi.new("TAOS_RES *", nil))
+    -- new() already rejects a NULL pointer, so build a wrapper and null
+    -- out its handle to exercise the accessor guards (e.g. after free()).
+    local r = result:new(helper.res())
+    r.result = nil
     helper.assert_eq(r:errstr(), "")
     helper.assert_eq(r:errno(), 0)
     helper.assert_eq(#helper.calls("taos_errstr"), 0)

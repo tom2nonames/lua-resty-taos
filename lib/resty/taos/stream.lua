@@ -50,6 +50,11 @@ function _M.open(self, sql, stime, handle, callback )
 
 
         local result = taos_result:new(res)
+        if result == nil then
+            -- The stream machinery can invoke the handler with a NULL
+            -- result (e.g. at teardown); there is no row to convert.
+            return
+        end
 
         local fields = result:fetch_fields()
         local num_fields = result:field_count()
