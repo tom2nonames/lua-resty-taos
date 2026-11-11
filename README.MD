@@ -87,6 +87,36 @@ Methods: `new()`, `connect(conf)`, `close()`, `query(sql)`,
 `get_client_info()`, `get_server_info()`, `get_error_string(res?)`,
 `get_error_no(res?)`, `init()`, `cleanup()`.
 
+### connection pooling (opt-in)
+
+By default every `connect()` opens a new C connection and every `close()`
+closes it.  For per-request workloads that is mostly pure overhead (the
+reference stack spends 5–20 ms per request on connect+close, versus well
+under a millisecond on a point query), so the driver can keep a small
+per-worker idle pool instead.  Enable it with `pool = true`:
+
+```lua
+local driver = taos:new()
+driver:connect({
+    host = "127.0.0.1", port = 6030,
+    user = "root", password = "taosdata",
+    pool = true,                       -- reuse connections in this worker
+})
+
+-- ... work ...
+
+driver:close()   -- returns the connection to the worker pool
+```
+
+The pool is keyed by host/port/user/database, keeps at most 16 idle
+connections per key and expires them after 30 seconds (expired handles are
+closed).  `close()` returns the handle to the pool instead of calling
+`taos_close()`, so a later `connect()` with the same conf skips
+`taos_init()`/`taos_connect()`.  A connection is closed for real — never
+pooled — when a query returned an error, `select_db()` changed the default
+database, or an async query was issued on the driver.  See section 8 of
+the best practices for the full rules.
+
 ## resty.taos.result — result set
 
 Wraps a C `TAOS_RES*` handle.  `query()` uses it internally; use it
@@ -424,6 +454,24 @@ template**:
 The example endpoints follow the guidance above: failures are reported as
 numeric `code=` values, and the container's `error_log` runs at `warn`
 (never `debug`).
+
+## 8. Connection pooling is opt-in — prefer it for per-request workloads
+
+`connect()` + `close()` costs 5–20 ms per request on the reference stack,
+most of it inside `taos_close()`, while a point query takes a fraction of a
+millisecond.  Set `pool = true` in the connection conf to reuse connections
+inside the worker:
+
+* the pool is keyed by host/port/user/database; each key keeps at most 16
+  idle handles, expiring them after 30 s (expired handles are closed);
+* `close()` puts a healthy handle back instead of calling `taos_close()`, so
+  the next `connect()` with the same conf skips `taos_init()` and
+  `taos_connect()`;
+* a handle is closed for real when a query failed, `select_db()` changed the
+  default database, or the driver ran an async query — those states do not
+  match the pool key's assumptions;
+* statements, subscriptions and streams stay per-driver objects: tear them
+  down before `close()`, and don't share one pooled handle between drivers.
 
 # unit tests
 Two suites are provided.  Neither requires a TDengine server or the

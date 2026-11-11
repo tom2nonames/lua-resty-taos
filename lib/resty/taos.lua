@@ -2,6 +2,7 @@ local taos_lib    = require("resty.taos.library")
 local taos_result = require("resty.taos.result")
 local taos_async  = require("resty.taos.async")
 local taos_stmt   = require("resty.taos.stmt")
+local taos_pool   = require("resty.taos.pool")
 local ffi = require("ffi")
 
 
@@ -21,6 +22,31 @@ local sfmt = string.format
 local ok, new_tab = pcall(require, "table.new")
 if not ok then
     new_tab = function (narr, nrec) return {} end
+end
+
+
+-- Per-worker idle connection pool (see resty.taos.pool and the README).
+-- It is created lazily the first time a connection is opened with
+-- conf.pool = true, so drivers that do not opt in never touch it.
+local pool_instance
+local function get_pool()
+    if pool_instance == nil then
+        pool_instance = taos_pool:new({
+            max_idle     = 16,
+            idle_timeout = 30000, -- 30 s
+            close        = function(conn)
+                C.taos_close(conn)
+            end,
+        })
+    end
+    return pool_instance
+end
+
+-- Pooled connections are only interchangeable when they point at the same
+-- server, user and default database.
+local function pool_key_of(conf)
+    return sfmt("%s:%s:%s:%s", conf.host or "", conf.port or "",
+                conf.user or "", conf.database or "")
 end
 
 
@@ -113,6 +139,31 @@ function _M.options(self, opts)
 end
 
 function _M.connect(self, conf)
+    -- Reset the pooling bookkeeping from any previous session on this
+    -- driver object.
+    self._pooled = nil
+    self._pool_key = nil
+    self._bad = nil
+    self._db_dirty = nil
+
+    -- Opt-in connection reuse: when conf.pool is set, try to take an idle
+    -- connection for the same target from the per-worker pool first.
+    local pkey = nil
+    if conf.pool then
+        pkey = pool_key_of(conf)
+        local conn = get_pool():acquire(pkey)
+        if conn ~= nil then
+            self.conn = conn
+            self._pooled = true
+            self._pool_key = pkey
+            return {
+                code  = 0,
+                conn  = conn,
+                error = nil
+            }
+        end
+    end
+
     local code = 0
     local err_msg = nil
     self:init()
@@ -140,9 +191,13 @@ function _M.connect(self, conf)
         -- attaching ANY finalizer (C function or closure) to the TAOS*
         -- handle makes tightly-looped queries segfault under LuaJIT (a
         -- client/library interaction; verified with bare FFI).  The
-        -- connection is therefore released exclusively by the explicit
-        -- close() call.
+        -- connection is therefore released explicitly: by close(), or by
+        -- the pool's idle-expiry cleanup.
         self.conn = taos
+        if pkey ~= nil then
+            self._pooled = true
+            self._pool_key = pkey
+        end
     end
 
     return {
@@ -167,11 +222,20 @@ function _M.query(self, sql)
         end)
         result:free()
         if ok then
+            -- A failed statement can leave the connection in an unknown
+            -- state; never hand it to the next pooled user.
+            if ret ~= nil and ret.code ~= 0 then
+                self._bad = true
+            end
             return ret
         end
+        self._bad = true
         error(ret, 0)
     end
 
+    -- No result handle at all: the C call itself failed, so the connection
+    -- must not be reused by the pool either.
+    self._bad = true
     return nil
 end
 
@@ -212,7 +276,16 @@ function _M.close(self)
     local err_msg = "null pointer."
 
     if taos ~= nil then
-        C.taos_close(taos)
+        -- Return the handle to the pool only when it is still reusable:
+        -- a failed statement, a changed default database (select_db) or a
+        -- pending async operation all leave state the next user must not
+        -- inherit, so those handles are closed for real.
+        if self._pooled and not self._bad and not self._db_dirty
+           and self.asyncs == nil then
+            get_pool():release(self._pool_key, taos)
+        else
+            C.taos_close(taos)
+        end
         code = 0
         err_msg = "done."
     end
@@ -221,6 +294,10 @@ function _M.close(self)
     -- Release any async wrappers whose callbacks never fired (the driver
     -- is done, so their trampolines are no longer needed).
     self.asyncs = nil
+    self._pooled = nil
+    self._pool_key = nil
+    self._bad = nil
+    self._db_dirty = nil
     return {
         code  = code,
         error = err_msg
@@ -240,8 +317,15 @@ function _M.select_db(self, db)
     if self.conn ~= nil and db then
         local recode = C.taos_select_db(self.conn, db)
         if recode < 0 then
+            -- The connection is now in an unknown state: do not pool it.
+            self._bad = true
             return nil, self:get_error_string()
         elseif recode == 0 then
+            -- A pooled connection now points at a different database than
+            -- its pool key claims, so close() must not return it.
+            if self._pooled then
+                self._db_dirty = true
+            end
             return true, nil
         end
     end

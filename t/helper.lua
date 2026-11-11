@@ -191,12 +191,22 @@ function _M.null()
 end
 
 -- Builds a TAOS_ROW (void**) whose columns point at the given buffers.
+--
+-- The returned pointer is raw address data: ffi.cast() does not keep the
+-- row array (or buffers created inline at the call site) reachable, so
+-- without an anchor the GC can collect them while the library is still
+-- dereferencing the row.  That use-after-free is invisible most of the
+-- time but turns into garbage reads (and segfaults) under a debug hook,
+-- which runs the GC much more often.
+local row_anchors = {}
+
 function _M.row(...)
     local cols = { ... }
     local arr = ffi.new("void *[?]", #cols)
     for i = 1, #cols do
         arr[i - 1] = ffi.cast("void *", cols[i])
     end
+    row_anchors[#row_anchors + 1] = { arr = arr, cols = cols }
     return ffi.cast("void **", arr)
 end
 

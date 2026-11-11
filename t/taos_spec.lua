@@ -337,3 +337,170 @@ helper.test("stmt() creates a prepared statement bound to the connection", funct
     helper.assert_nil(s2)
     helper.assert_eq(err, "not connected.")
 end)
+
+-- ---------------------------------------------------------------------------
+-- Connection pooling (opt-in via conf.pool).  Every test uses a unique
+-- target so the module-level pool never leaks state between cases.
+-- ---------------------------------------------------------------------------
+
+local function pool_conf(n)
+    return {
+        host = "pool-host-" .. n,
+        port = 6030,
+        user = "root",
+        password = "taosdata",
+        database = "pool_db_" .. n,
+        pool = true,
+    }
+end
+
+helper.test("pooled connect()/close() reuses the C connection", function()
+    helper.reset()
+    local conf = pool_conf(1)
+    helper.on("taos_connect", function() return helper.ptr() end)
+
+    local d1 = taos:new()
+    local c1 = d1:connect(conf)
+    helper.assert_eq(c1.code, 0)
+    helper.assert_eq(#helper.calls("taos_connect"), 1)
+
+    -- A healthy connection is returned to the pool, not closed.
+    d1:close()
+    helper.assert_eq(#helper.calls("taos_close"), 0)
+
+    local d2 = taos:new()
+    local c2 = d2:connect(conf)
+    helper.assert_eq(c2.code, 0)
+    helper.assert_eq(c2.conn, c1.conn)
+    -- Reuse must not create another C connection nor re-run taos_init.
+    helper.assert_eq(#helper.calls("taos_connect"), 1)
+    helper.assert_eq(#helper.calls("taos_init"), 1)
+
+    d2:close()
+    helper.assert_eq(#helper.calls("taos_close"), 0)
+end)
+
+helper.test("pooled close() discards a connection that saw a query error", function()
+    helper.reset()
+    local conf = pool_conf(2)
+    helper.on("taos_connect", function() return helper.ptr() end)
+    helper.on("taos_query", function() return helper.res() end)
+    helper.on("taos_errno", function() return 90001 end)
+    helper.on("taos_errstr", function() return "syntax error" end)
+
+    local d = taos:new()
+    d:connect(conf)
+    local r = d:query("bad sql")
+    helper.assert_eq(r.code, 90001)
+    d:close()
+    helper.assert_eq(#helper.calls("taos_close"), 1)
+end)
+
+helper.test("pooled close() discards a connection with a changed default database", function()
+    helper.reset()
+    local conf = pool_conf(3)
+    helper.on("taos_connect", function() return helper.ptr() end)
+    helper.on("taos_select_db", function() return 0 end)
+
+    local d = taos:new()
+    d:connect(conf)
+    local ok = d:select_db("other_db")
+    helper.assert_true(ok)
+    d:close()
+    helper.assert_eq(#helper.calls("taos_close"), 1)
+end)
+
+helper.test("pooled close() closes instead of pooling after async work", function()
+    helper.reset()
+    local conf = pool_conf(4)
+    helper.on("taos_connect", function() return helper.ptr() end)
+
+    local d = taos:new()
+    d:connect(conf)
+    d:query_async("select 1", function() end)
+    d:close()
+    helper.assert_eq(#helper.calls("taos_close"), 1)
+end)
+
+helper.test("pooled connect() failure stores nothing and closes nothing", function()
+    helper.reset()
+    local conf = pool_conf(5)
+    helper.on("taos_connect", function() return nil end)
+
+    local d = taos:new()
+    local r = d:connect(conf)
+    helper.assert_eq(r.code, -1)
+    helper.assert_nil(d.conn)
+    d:close()
+    helper.assert_eq(#helper.calls("taos_close"), 0)
+end)
+
+helper.test("pooled select_db() failure marks the connection bad", function()
+    helper.reset()
+    local conf = pool_conf(6)
+    helper.on("taos_connect", function() return helper.ptr() end)
+    helper.on("taos_select_db", function() return -1 end)
+    helper.on("taos_errstr", function() return "no such database" end)
+
+    local d = taos:new()
+    d:connect(conf)
+    local ok, err = d:select_db("nope")
+    helper.assert_nil(ok)
+    helper.assert_eq(err, "no such database")
+    d:close()
+    helper.assert_eq(#helper.calls("taos_close"), 1)
+end)
+
+helper.test("pooled close() closes the overflow when the per-key pool is full", function()
+    helper.reset()
+    local conf = pool_conf(7)
+    helper.on("taos_connect", function() return helper.ptr() end)
+
+    -- The driver pool keeps at most 16 idle handles per target.  Open 17
+    -- connections at once, then close them all: the 16th fits, the 17th
+    -- must release the C connection instead of storing it.
+    local drivers = {}
+    for i = 1, 17 do
+        drivers[i] = taos:new()
+        local c = drivers[i]:connect(conf)
+        helper.assert_eq(c.code, 0)
+    end
+    for i = 1, 17 do
+        drivers[i]:close()
+    end
+
+    helper.assert_eq(#helper.calls("taos_connect"), 17)
+    helper.assert_eq(#helper.calls("taos_close"), 1)
+end)
+
+helper.test("query() marks the connection bad when result conversion raised", function()
+    helper.reset()
+    local driver = taos:new()
+    connect_ok(driver)
+    helper.on("taos_query", function() return helper.res() end)
+    -- totable() raises mid-conversion; query() re-raises and must mark the
+    -- connection unusable so a later pooled close() will not reuse it.
+    helper.on("taos_errno", function() error("boom") end)
+
+    local ok, err = pcall(function() return driver:query("select 1") end)
+    helper.assert_false(ok)
+    helper.assert_true(tostring(err):find("boom", 1, true) ~= nil)
+    helper.assert_true(driver._bad)
+
+    driver:close()
+    helper.assert_eq(#helper.calls("taos_close"), 1)
+end)
+
+helper.test("pooled close() discards a connection when taos_query returns no result", function()
+    helper.reset()
+    local conf = pool_conf(9)
+    helper.on("taos_connect", function() return helper.ptr() end)
+    helper.on("taos_query", function() return nil end)
+
+    local d = taos:new()
+    d:connect(conf)
+    helper.assert_nil(d:query("select 1"))
+
+    d:close()
+    helper.assert_eq(#helper.calls("taos_close"), 1)
+end)

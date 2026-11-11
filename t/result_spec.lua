@@ -40,6 +40,7 @@ helper.test("errstr/errno are safe on a NULL result", function()
     -- Regression: a NULL cdata is truthy, so the old `if self.result then`
     -- guard passed and the C function was called with NULL.  errstr/errno
     -- must return "" / 0 and never touch the C library.
+    helper.reset()
     local r = result:new(ffi.new("TAOS_RES *", nil))
     helper.assert_eq(r:errstr(), "")
     helper.assert_eq(r:errno(), 0)

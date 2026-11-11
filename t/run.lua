@@ -22,6 +22,7 @@ local DEFAULT_SPECS = {
     "t.library_spec",
     "t.data_spec",
     "t.taos_spec",
+    "t.pool_spec",
     "t.result_spec",
     "t.stmt_spec",
     "t.subscribe_spec",

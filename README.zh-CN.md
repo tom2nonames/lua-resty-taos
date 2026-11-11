@@ -84,6 +84,33 @@ driver:close()
 `get_client_info()`、`get_server_info()`、`get_error_string(res?)`、
 `get_error_no(res?)`、`init()`、`cleanup()`。
 
+### 连接池(可选启用)
+
+默认每次 `connect()` 都会新建一条 C 连接,`close()` 则关闭它。对按请求
+处理的工作负载,这部分几乎全是纯开销(参考环境下 connect+close 每次约
+5–20 ms,而一次点查询远低于 1 ms)。驱动可为每个 worker 保留一个小型
+空闲连接池,在 conf 中设置 `pool = true` 即可启用:
+
+```lua
+local driver = taos:new()
+driver:connect({
+    host = "127.0.0.1", port = 6030,
+    user = "root", password = "taosdata",
+    pool = true,                       -- 在本 worker 内复用连接
+})
+
+-- ... 业务处理 ...
+
+driver:close()   -- 将连接归还到 worker 连接池
+```
+
+连接池以 host/port/user/database 为键,每个键最多保留 16 条空闲连接,
+30 秒后过期(过期连接会被关闭)。`close()` 会把健康连接归还到池中而不是
+调用 `taos_close()`,因此后续用相同 conf 的 `connect()` 会跳过
+`taos_init()` 与 `taos_connect()`。以下情况会真正关闭连接、不归还:
+查询返回错误、`select_db()` 改变了默认数据库、或在驱动上发起过异步查询。
+完整规则见最佳实践第 8 节。
+
 ## resty.taos.result — 结果集
 
 封装 C 层 `TAOS_RES*` 句柄。`query()` 内部使用它;当你需要逐行访问或底层
@@ -405,6 +432,21 @@ end
 
 示例端点遵循上述约定:失败以数字 `code=` 形式报告,容器 `error_log`
 级别为 `warn`(绝不使用 `debug`)。
+
+## 8. 连接池是可选项 —— 按请求的工作负载建议启用
+
+参考环境下 `connect()` + `close()` 每次请求约 5–20 ms,其中大部分耗在
+`taos_close()` 内;而一次点查询只需零点几毫秒。在连接 conf 中设置
+`pool = true`,即可在 worker 内复用连接:
+
+* 连接池以 host/port/user/database 为键;每个键最多保留 16 条空闲连接,
+  30 秒后过期(过期连接会被关闭);
+* `close()` 会把健康连接归还到池中而不是调用 `taos_close()`,因此下一次
+  用相同 conf 的 `connect()` 会跳过 `taos_init()` 与 `taos_connect()`;
+* 以下情况会真正关闭连接:查询失败、`select_db()` 改变了默认数据库、
+  或驱动发起过异步查询 —— 这些状态不再符合连接池键的假设;
+* 语句、订阅与流仍是每个驱动独立的对象:请在 `close()` 之前拆除,
+  不要把同一条池化连接交给多个驱动共用。
 
 # 单元测试
 

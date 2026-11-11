@@ -176,3 +176,37 @@ GET /t
 0|true|nil|nil|27
 --- no_error_log
 [error]
+
+=== TEST 7: pooled connect/close/connect reuses one C connection
+--- config
+    location /t {
+        content_by_lua_block {
+            local util = require("t.nginx_util")
+            local taos = require("resty.taos")
+
+            util.on("taos_connect", function() return util.ptr() end)
+
+            local conf = {
+                host = "127.0.0.1", port = 6030,
+                user = "root", password = "taosdata",
+                pool = true,
+            }
+
+            local d1 = taos:new()
+            d1:connect(conf)
+            local c1 = d1:close()
+
+            local d2 = taos:new()
+            local c2 = d2:connect(conf)
+            d2:close()
+
+            ngx.say(c2.code .. "|" .. #util.calls("taos_connect")
+                    .. "|" .. #util.calls("taos_close") .. "|" .. c1.code)
+        }
+    }
+--- request
+GET /t
+--- response_body
+0|1|0|0
+--- no_error_log
+[error]
