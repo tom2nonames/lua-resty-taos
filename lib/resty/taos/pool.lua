@@ -11,7 +11,7 @@
 -- callback never releases expired handles; production always passes one
 -- (the unit tests use this to observe what would have been closed).
 
-local _M = { _VERSION = '0.1' }
+local _M = { _VERSION = '0.1-3' }
 
 local mt = { __index = _M }
 

@@ -36,7 +36,7 @@ __DATA__
 --- request
 GET /t
 --- response_body
-0.1
+0.1-3
 --- no_error_log
 [error]
 

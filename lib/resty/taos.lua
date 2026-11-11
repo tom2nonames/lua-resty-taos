@@ -50,7 +50,7 @@ local function pool_key_of(conf)
 end
 
 
-local _M = { _VERSION = '0.1' }
+local _M = { _VERSION = '0.1-3' }
 
 
 local mt = { __index = _M }
