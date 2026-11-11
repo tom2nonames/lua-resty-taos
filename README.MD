@@ -207,6 +207,10 @@ Module API: `new(cwrap)`, `query(sql, callback)`, `fetch_rows(res,
 callback)` (normally used through `driver:query_async()` /
 `driver:fetch_rows_async()`).
 
+The driver keeps each callback alive until it fires and caps the number of
+pending operations at 64 per connection; see section 4 of the best
+practices below.
+
 ## resty.taos.subscribe — topic subscription
 
 Subscribe to a query result set and poll (or receive) the changes.
@@ -395,22 +399,25 @@ without, using bare FFI).  The driver therefore uses **explicit release +
 pcall-guarded cleanup** everywhere instead of GC finalizers.  When
 extending the library, keep it that way.
 
-## 4. Async queries: the driver keeps callbacks alive, then drops them
+## 4. Async queries: callbacks are kept alive, then dropped (list is capped)
 
 `driver:query_async()`/`fetch_rows_async()` keep the callback trampoline
 alive on the driver until the callback fires (the C side may invoke it
 after `query_async()` returns).  Once the callback fires, the wrapper is
-removed from the driver's keep-alive list, so repeated `query_async()`
-calls do not accumulate:
+detached from the keep-alive list; the callback cdata itself stays
+referenced until the trampoline has returned and is then reclaimed by the
+GC, so its machine code is never freed while C is still executing it.
 
-```lua
-for i = 1, 1000 do
-    driver:query_async("select 1", function() end)  -- list stays bounded
-end
-```
+A driver cannot know whether a reply will ever arrive, so the keep-alive
+list is capped at **64 pending operations per connection**.  Past that
+limit both functions return `nil, "too many pending async queries
+(max 64)"` instead of growing without bound; wait for some callbacks to
+fire before issuing more.
 
-If you abandon a driver with pending async callbacks, `close()` clears
-the keep-alive list.
+Do not call `close()` while async operations are still in flight: the
+library then drops the trampolines and cannot prevent a late callback
+from touching freed memory.  Wait for the callbacks you care about, or
+do not issue async work on a short-lived driver.
 
 ## 5. Subscriptions and streams must be torn down explicitly
 
@@ -429,7 +436,7 @@ the keep-alive list.
 |---|---|---|
 | RSS grows with every request | driver created per request, `close()` never called | close in `log_by_lua` / `ngx.on_abort` |
 | RSS grows in a subscribe loop | (older driver) consume result not freed | use the current driver (auto-frees) |
-| RSS grows with repeated `query_async` | (older driver) keep-alive list unbounded | use the current driver (list is bounded) |
+| RSS grows with repeated `query_async` | older driver kept every wrapper forever | current driver detaches fired callbacks and caps pending ops at 64 |
 | Worker segfaults in tight loops | (extension) an `ffi.gc` finalizer was added to a TAOS handle | remove it; use explicit release |
 | Lua error mid-conversion leaks | result freed only on the happy path | pcall-guarded release (current driver) |
 

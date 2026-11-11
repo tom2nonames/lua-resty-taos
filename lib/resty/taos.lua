@@ -239,17 +239,52 @@ function _M.query(self, sql)
     return nil
 end
 
+-- Upper bound on async callbacks pinned per connection.  A driver cannot
+-- know whether the C side will ever deliver a reply, so a callback that
+-- never fires would otherwise pin its wrapper (and the callback trampoline)
+-- forever.  Past the limit, new async work is refused instead of growing
+-- the keep-alive list without bound.
+local MAX_PENDING_ASYNC = 64
+
+local function pending_asyncs(self)
+    local n = 0
+    local asyncs = self.asyncs
+    if asyncs ~= nil then
+        for _ in pairs(asyncs) do
+            n = n + 1
+        end
+    end
+    return n
+end
+
+-- Slot reuse keeps the keep-alive array compact when callbacks fire in an
+-- arbitrary order.  (`#` is not reliable once a slot has been emptied.)
+local function first_free_async_slot(asyncs)
+    local slot = 1
+    while asyncs[slot] ~= nil do
+        slot = slot + 1
+    end
+    return slot
+end
+
 function _M.query_async(self, sql, callback)
+    if type(callback) ~= "function" then
+        return nil, "callback set error!"
+    end
+    if pending_asyncs(self) >= MAX_PENDING_ASYNC then
+        return nil, sfmt("too many pending async queries (max %d)",
+                         MAX_PENDING_ASYNC)
+    end
     local async = taos_async:new(self)
     local ok, err = async:query(sql, callback)
     if ok then
         -- The C side may still invoke the callback after this function
         -- returns, so the async wrapper (and the callback trampoline it
-        -- references) must stay alive.  Retain it on the driver with a
-        -- slot; async.lua removes it once the callback has fired, so the
-        -- list stays bounded (see async.lua query()).
+        -- references) must stay alive.  Retain it on the driver until the
+        -- callback fires; async.lua detaches it then (and the list is
+        -- capped above, so it cannot grow without bound).
         self.asyncs = self.asyncs or {}
-        local slot = #self.asyncs + 1
+        local slot = first_free_async_slot(self.asyncs)
         self.asyncs[slot] = async
         async._driver = self
         async._slot = slot
@@ -258,11 +293,18 @@ function _M.query_async(self, sql, callback)
 end
 
 function _M.fetch_rows_async(self, res, callback)
+    if type(callback) ~= "function" then
+        return nil, "callback set error!"
+    end
+    if pending_asyncs(self) >= MAX_PENDING_ASYNC then
+        return nil, sfmt("too many pending async queries (max %d)",
+                         MAX_PENDING_ASYNC)
+    end
     local async = taos_async:new(self)
     local ok, err = async:fetch_rows(res, callback)
     if ok then
         self.asyncs = self.asyncs or {}
-        local slot = #self.asyncs + 1
+        local slot = first_free_async_slot(self.asyncs)
         self.asyncs[slot] = async
         async._driver = self
         async._slot = slot
@@ -290,9 +332,19 @@ function _M.close(self)
         err_msg = "done."
     end
 
+    if self.asyncs ~= nil then
+        local pending = pending_asyncs(self)
+        if pending > 0 then
+            ngx_log(ngx_WARN, "taos close() with ", pending,
+                    " async callback(s) still in flight; the callbacks ",
+                    "must not fire after close()")
+        end
+    end
+
     self.conn = nil
-    -- Release any async wrappers whose callbacks never fired (the driver
-    -- is done, so their trampolines are no longer needed).
+    -- Release any async wrappers whose callbacks never fired.  NOTE: the
+    -- C side may still hold the callback pointer, so a caller must not
+    -- close() a driver while its async operations are in flight.
     self.asyncs = nil
     self._pooled = nil
     self._pool_key = nil

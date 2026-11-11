@@ -27,6 +27,25 @@ local _M = { _VERSION = '0.1' }
 
 local mt = { __index = _M }
 
+-- Removes a fired wrapper from its driver's keep-alive list.
+--
+-- Do NOT clear self.handle / self.param here: this runs inside the callback
+-- trampoline, while the machine code C invoked is still on the stack.
+-- Dropping the last Lua reference to the callback cdata from here would let
+-- the GC free that machine code mid-call (use-after-free).  Removing the
+-- driver reference is enough: with no other reference the
+-- self -> callback cdata -> closure -> self cycle becomes garbage and is
+-- reclaimed only after this trampoline has returned.
+local function detach(self)
+    local driver = self._driver
+    if driver ~= nil and driver.asyncs ~= nil
+       and driver.asyncs[self._slot] == self then
+        driver.asyncs[self._slot] = nil
+    end
+    self._driver = nil
+    self._slot = nil
+end
+
 ffi_cdef([[
     typedef struct {
         CALLBACK callback;
@@ -49,6 +68,14 @@ function _M.query(self, sql, callback)
 
     local handle = ffi_new("TAOS_QUERY_CALLBACK",
                             function(param, res, code)
+                                -- The driver no longer needs to keep this
+                                -- wrapper alive.  Detach first so a user
+                                -- callback that raises cannot pin it, but
+                                -- keep self.handle/self.param referenced
+                                -- until the trampoline returns (see
+                                -- detach()).
+                                detach(self)
+
                                 -- `callback` is captured as an upvalue and
                                 -- invoked directly as a Lua function.
                                 -- Previously the callback was wrapped in a
@@ -72,23 +99,6 @@ function _M.query(self, sql, callback)
                                     })
                                 end
 
-                                -- LEAK FIX: taos_query_a() invokes its
-                                -- callback exactly once, so once we are
-                                -- here the C side will never call this
-                                -- trampoline again.  Drop the references so
-                                -- the callback cdata (and its machine-code
-                                -- trampoline) become garbage-collectable,
-                                -- and remove the wrapper from the driver's
-                                -- keep-alive list.  Otherwise every
-                                -- query_async() leaks one wrapper + one
-                                -- trampoline for the lifetime of the
-                                -- driver.
-                                self.handle = nil
-                                self.param = nil
-                                if self._driver and self._driver.asyncs
-                                   and self._driver.asyncs[self._slot] == self then
-                                    self._driver.asyncs[self._slot] = nil
-                                end
                                 return ret
                             end)
 
@@ -118,8 +128,11 @@ function _M.fetch_rows(self, res, callback)
 
     local handle = ffi_new("TAOS_QUERY_CALLBACK",
                             function(param, tres, num_of_rows)
-                                -- See query(): invoke the Lua callback
-                                -- directly rather than through a cdata.
+                                -- See query(): detach first (so a raising
+                                -- callback cannot pin the wrapper), then
+                                -- invoke the Lua callback directly rather
+                                -- than through a cdata.
+                                detach(self)
                                 return callback({
                                     num_of_rows = num_of_rows,
                                     res = tres
